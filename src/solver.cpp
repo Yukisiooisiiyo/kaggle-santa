@@ -49,9 +49,12 @@ struct Params {
     int effort = 1;        // 0: depth<=3 exact, 1: + S2 (depth 4), 2: + depth 5
     double rate = 5.5;     // bits per instruction assumed by the heuristic
     double minRate = 2.5;  // minimum bits gained per instruction for a move
-    int small = 4096;      // values <= small are protected from eviction
-    int keepBonus = 40;
+    int small = 65536;      // values <= small are protected from eviction
+    int keepBonus = 300;
     int vote = 1;
+    double useW = 0, bitW = 0;
+    int prime = 4;
+    int primeMax = 6;
     int maxCand = 300;
 };
 static Params G;
@@ -205,6 +208,7 @@ struct Ctx {
         if (maxd >= 2 && (s2built ? S2.has(v) : true)) { if (d2(v, p)) return 2; }
         if (maxd >= 3 && d3(v, p)) return 3;
         if (maxd >= 4 && G.effort >= 1 && d4(v, p)) return 4;
+        if (maxd >= 5 && G.effort >= 2 && d5(v, p)) return 5;
         return -1;
     }
     // drop steps whose result already exists
@@ -319,7 +323,7 @@ struct Ctx {
             if (nd.g + 1 >= best) continue;
             if (seen[nd.v] < nd.g) continue;
             expansions++;
-            Plan p; int maxd = min(4, best - nd.g - 1);
+            Plan p; int maxd = min(idx == 0 ? 5 : 4, best - nd.g - 1);
             int d = exact(nd.v, p, maxd);
             if (d >= 0) {
                 int i = idx;
@@ -430,10 +434,10 @@ struct Puzzle {
 };
 
 struct Machine {
-    int nreg; vector<u64> val; vector<char> def; vector<long> last; long clock = 0;
+    int nreg; vector<u64> val; vector<char> def; vector<long> last; vector<int> uses; long clock = 0;
     unordered_map<u64, int> where; vector<Inst> prog;
     void init(const Puzzle& pz) {
-        nreg = pz.nreg; val.assign(nreg, 0); def.assign(nreg, 0); last.assign(nreg, 0);
+        nreg = pz.nreg; val.assign(nreg, 0); def.assign(nreg, 0); last.assign(nreg, 0); uses.assign(nreg, 0);
         for (size_t i = 0; i < pz.start.size(); i++) {
             val[i] = pz.start[i]; def[i] = 1;
             if (!where.count(val[i])) where[val[i]] = (int)i;
@@ -457,15 +461,15 @@ struct Machine {
                 long bestScore = LONG_MAX;
                 for (int r = 0; r < nreg; r++) {
                     if (need.count(val[r])) continue;
-                    long sc = last[r] + (val[r] <= (u64)G.small ? G.keepBonus : 0);
+                    long sc = last[r] + (val[r] <= (u64)G.small ? G.keepBonus : 0) + (long)(uses[r] * G.useW) - (long)(G.bitW * log2((double)val[r]));
                     if (sc < bestScore) { bestScore = sc; dst = r; }
                 }
             }
             if (dst < 0) { fprintf(stderr, "no register available\n"); exit(1); }
             clock++;
-            last[ra] = clock; last[rb] = clock;
+            last[ra] = clock; last[rb] = clock; uses[ra]++; uses[rb]++;
             if (def[dst] && where.at(val[dst]) == dst) where.erase(val[dst]);
-            val[dst] = s.res; def[dst] = 1; last[dst] = clock; where[s.res] = dst;
+            val[dst] = s.res; def[dst] = 1; last[dst] = clock; uses[dst] = 0; where[s.res] = dst;
             prog.push_back({s.op, ra, rb, dst});
         }
     }
@@ -474,6 +478,7 @@ struct Machine {
 static vector<Inst> solvePuzzle(const Puzzle& pz, Ctx& C, vector<int>& costs) {
     Machine M; M.init(pz);
     set<u64> rem(pz.targets.begin(), pz.targets.end());
+    bool primed = false;
     for (u64 s : pz.start) rem.erase(s);
     while (!rem.empty()) {
         C.build(M.pool(), pz.limit);
@@ -513,6 +518,15 @@ static vector<Inst> solvePuzzle(const Puzzle& pz, Ctx& C, vector<int>& costs) {
                 }
             }
         }
+        if (!found && !primed && G.prime > 0 && (int)C.P.size() <= G.primeMax) {
+            // first hard target: seed the pool with 1, 2, 4, ... so residues become cheap
+            primed = true; plan.clear();
+            u64 a = C.P[0];
+            plan.push_back({'/', a, a, 1});
+            u64 x = 1;
+            for (int i = 0; i < G.prime && x * 2 <= pz.limit; i++) { plan.push_back({'+', x, x, x * 2}); x *= 2; }
+            found = true;
+        }
         if (!found) {
             u64 t = *rem.begin(); plan.clear();
             if (!C.hard(t, plan, G.minRate, G.nodes, G.rate)) {
@@ -526,7 +540,24 @@ static vector<Inst> solvePuzzle(const Puzzle& pz, Ctx& C, vector<int>& costs) {
         costs.push_back((int)(M.prog.size() - before));
         for (auto& s : plan) rem.erase(s.res);
     }
-    return M.prog;
+    // dead-code elimination: keep only instructions that feed a target
+    const vector<Inst>& pr = M.prog; int n = (int)pr.size();
+    vector<int> writer(pz.nreg, -1), da(n), db(n); vector<u64> val(pz.nreg, 0), res(n);
+    for (size_t i = 0; i < pz.start.size(); i++) val[i] = pz.start[i];
+    set<u64> need(pz.targets.begin(), pz.targets.end());
+    for (u64 s : pz.start) need.erase(s);
+    vector<char> live(n, 0);
+    for (int i = 0; i < n; i++) {
+        da[i] = writer[pr[i].a]; db[i] = writer[pr[i].b];
+        u64 a = val[pr[i].a], b = val[pr[i].b], r = 0;
+        switch (pr[i].op) { case '+': r = a + b; break; case '-': r = a - b; break; case '*': r = a * b; break; default: r = a / b; }
+        res[i] = r; val[pr[i].d] = r; writer[pr[i].d] = i;
+        if (need.erase(r)) live[i] = 1;
+    }
+    for (int i = n - 1; i >= 0; i--) if (live[i]) { if (da[i] >= 0) live[da[i]] = 1; if (db[i] >= 0) live[db[i]] = 1; }
+    vector<Inst> out;
+    for (int i = 0; i < n; i++) if (live[i]) out.push_back(pr[i]);
+    return out;
 }
 
 // ---------- CSV ----------
@@ -564,6 +595,10 @@ int main(int argc, char** argv) {
         else if (a == "--bonus") G.keepBonus = stoi(nxt());
         else if (a == "--only") only = nxt();
         else if (a == "--vote") G.vote = stoi(nxt());
+        else if (a == "--usew") G.useW = stod(nxt());
+        else if (a == "--bitw") G.bitW = stod(nxt());
+        else if (a == "--prime") G.prime = stoi(nxt());
+        else if (a == "--primemax") G.primeMax = stoi(nxt());
         else if (a == "--maxcand") G.maxCand = stoi(nxt());
     }
     ifstream in(argv[1]); string line; getline(in, line);
