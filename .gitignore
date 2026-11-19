@@ -1,0 +1,5 @@
+data/
+out/
+solver
+*.o
+__pycache__/
