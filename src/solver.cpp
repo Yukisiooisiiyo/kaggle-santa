@@ -52,6 +52,7 @@ struct Params {
     int small = 65536;      // values <= small are protected from eviction
     int keepBonus = 300;
     int vote = 1;
+    int pick = 1;
     double useW = 0, bitW = 0;
     int prime = 4;
     int primeMax = 6;
@@ -528,10 +529,17 @@ static vector<Inst> solvePuzzle(const Puzzle& pz, Ctx& C, vector<int>& costs) {
             found = true;
         }
         if (!found) {
-            u64 t = *rem.begin(); plan.clear();
-            if (!C.hard(t, plan, G.minRate, G.nodes, G.rate)) {
-                bool ok = C.hard(t, plan, 0.3, max(2000, G.nodes * 10), 1.0);
-                if (!ok) { plan.clear(); C.construct(t, plan); }
+            // try the few smallest remaining targets and build the cheapest one
+            int tried = 0; size_t bestLen = SIZE_MAX;
+            for (u64 t : rem) {
+                if (tried++ >= G.pick) break;
+                Plan cand;
+                if (!C.hard(t, cand, G.minRate, G.nodes, G.rate)) {
+                    bool ok = C.hard(t, cand, 0.3, max(2000, G.nodes * 10), 1.0);
+                    if (!ok) { cand.clear(); C.construct(t, cand); }
+                }
+                C.finalize(cand);
+                if (cand.size() < bestLen) { bestLen = cand.size(); plan = cand; }
             }
         }
         C.finalize(plan);
@@ -595,6 +603,7 @@ int main(int argc, char** argv) {
         else if (a == "--bonus") G.keepBonus = stoi(nxt());
         else if (a == "--only") only = nxt();
         else if (a == "--vote") G.vote = stoi(nxt());
+        else if (a == "--pick") G.pick = stoi(nxt());
         else if (a == "--usew") G.useW = stod(nxt());
         else if (a == "--bitw") G.bitW = stod(nxt());
         else if (a == "--prime") G.prime = stoi(nxt());
